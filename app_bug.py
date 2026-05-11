@@ -33,7 +33,7 @@ else:
 
 def call_groq(api_key, system_prompt, user_prompt):
     response = requests.post(
-        "https://api.groqcom/openai/v1/chat/completions",
+        "https://api.groq.com/openai/v1/chat/completions",
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
         json={
             "model": "llama-3.3-70b-versatile",
