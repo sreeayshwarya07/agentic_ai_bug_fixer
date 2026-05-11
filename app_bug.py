@@ -8,7 +8,9 @@ st.caption("Powered by Groq · Four AI agents analyze, fix, explain, and optimiz
 
 with st.sidebar:
     st.header("⚙️ Configuration")
-    api_key = st.text_input("🔑 Groq API Key", type="password", placeholder="gsk_...")
+    api_key = st.secrets.get("GROQ_API_KEY", "")
+    if not api_key:
+        api_key = st.text_input("🔑 Groq API Key", type="password", placeholder="gsk_...")
     st.caption("Get your free key at [console.groq.com](https://console.groq.com)")
     language = st.selectbox("🌐 Language", [
         "Python", "JavaScript", "Java", "C++", "C",
@@ -31,7 +33,7 @@ else:
 
 def call_groq(api_key, system_prompt, user_prompt):
     response = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
+        "https://api.groqcom/openai/v1/chat/completions",
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
         json={
             "model": "llama-3.3-70b-versatile",
@@ -67,7 +69,7 @@ if run:
             with st.status("🛠️ Fixing...", expanded=False) as s:
                 results["fix"] = call_groq(api_key,
                     f"You are an expert {language} debugger. Return ONLY the complete corrected code inside a code block. No extra text.",
-                    f"Fix this buggy {language} code.\\n\\nBugs:\\n{results['bugs']}\\n\\nOriginal:\\n```{language}\\n{code}\\n```")
+                    f"Fix this buggy {language} code.\\n\\nBugs:\\n{results[\'bugs\']}\\n\\nOriginal:\\n```{language}\\n{code}\\n```")
                 s.update(label="🛠️ Debugger ✅", state="complete")
         progress.progress(55)
 
@@ -75,7 +77,7 @@ if run:
             with st.status("📖 Explaining...", expanded=False) as s:
                 results["explain"] = call_groq(api_key,
                     f"You are a friendly {language} teacher. Explain bugs and fixes in simple beginner-friendly language.",
-                    f"Explain these bugs and fixes.\\n\\nCode:\\n{code}\\n\\nBugs:\\n{results['bugs']}\\n\\nFix:\\n{results['fix']}")
+                    f"Explain these bugs and fixes.\\n\\nCode:\\n{code}\\n\\nBugs:\\n{results[\'bugs\']}\\n\\nFix:\\n{results[\'fix\']}")
                 s.update(label="📖 Explainer ✅", state="complete")
         progress.progress(78)
 
