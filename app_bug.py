@@ -1,111 +1,311 @@
-app_code = '''
 import streamlit as st
-import requests
+import os, json, subprocess, tempfile, textwrap, re
+from typing import TypedDict, List
+from langgraph.graph import StateGraph, START, END
+from langchain_groq import ChatGroq
+from langchain_core.messages import SystemMessage, HumanMessage
 
-st.set_page_config(page_title="🐛 Multi-Agent AI Bug Fixer", layout="wide")
-st.title("🐛 Multi-Agent AI Bug Fixer")
-st.caption("Powered by Groq · Four AI agents analyze, fix, explain, and optimize your code.")
+# ── API Key: Streamlit secrets first, env var fallback ─────────────────────
+API_KEY = st.secrets.get("Bug", os.environ.get("Bug", ""))
+if not API_KEY:
+    st.error("⚠️ API key not found. Add `Bug = \"your_groq_key\"` in Streamlit Cloud → Settings → Secrets.")
+    st.stop()
+
+llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=API_KEY, temperature=0.2, max_tokens=1500)
+
+class BugFixState(TypedDict):
+    code: str
+    language: str
+    bugs: List[dict]
+    severity: str
+    fixed_code: str
+    changes: List[dict]
+    execution_result: dict
+    review: dict
+    explanation: str
+    optimizations: dict
+    round_num: int
+    max_rounds: int
+    history: List[str]
+    next_step: str
+
+def _run(cmd, timeout=10):
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return {"executed": True, "success": proc.returncode == 0,
+                "stdout": proc.stdout[-1500:], "stderr": proc.stderr[-1500:],
+                "returncode": proc.returncode}
+    except subprocess.TimeoutExpired:
+        return {"executed": True, "success": False, "stdout": "", "stderr": f"Timed out after {timeout}s", "returncode": -1}
+    except FileNotFoundError as e:
+        return {"executed": False, "reason": f"Runtime not installed: {e}"}
+
+def execute_code_tool(code, language):
+    lang = language.strip().lower()
+    workdir = tempfile.mkdtemp()
+    try:
+        if lang == "python":
+            path = os.path.join(workdir, "main.py")
+            open(path, "w").write(code)
+            return _run(["python3", path])
+        elif lang in ("javascript", "js"):
+            path = os.path.join(workdir, "main.js")
+            open(path, "w").write(code)
+            return _run(["node", path])
+        elif lang in ("typescript", "ts"):
+            path = os.path.join(workdir, "main.ts")
+            open(path, "w").write(code)
+            compile_result = _run(["npx", "--yes", "tsc", "--target", "es2019", path], timeout=30)
+            if not compile_result["success"]:
+                compile_result["stage"] = "compile"
+                return compile_result
+            run_result = _run(["node", path.replace(".ts", ".js")])
+            run_result["stage"] = "run"
+            return run_result
+        elif lang == "java":
+            match = re.search(r"public\s+class\s+(\w+)", code)
+            class_name = match.group(1) if match else "Main"
+            path = os.path.join(workdir, f"{class_name}.java")
+            open(path, "w").write(code)
+            compile_result = _run(["javac", path], timeout=30)
+            if not compile_result["success"]:
+                compile_result["stage"] = "compile"
+                return compile_result
+            run_result = _run(["java", "-cp", workdir, class_name])
+            run_result["stage"] = "run"
+            return run_result
+        elif lang in ("c++", "cpp"):
+            path = os.path.join(workdir, "main.cpp")
+            binary = os.path.join(workdir, "main_bin")
+            open(path, "w").write(code)
+            compile_result = _run(["g++", "-std=c++17", path, "-o", binary], timeout=30)
+            if not compile_result["success"]:
+                compile_result["stage"] = "compile"
+                return compile_result
+            run_result = _run([binary])
+            run_result["stage"] = "run"
+            return run_result
+        else:
+            return {"executed": False, "reason": f"Execution not supported for '{language}' yet."}
+    finally:
+        subprocess.run(["rm", "-rf", workdir], capture_output=True)
+
+def _ask_json(system, user):
+    resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
+    raw = resp.content
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        start, end = raw.find("{"), raw.rfind("}")
+        if start != -1 and end != -1:
+            try:
+                return json.loads(raw[start:end + 1])
+            except json.JSONDecodeError:
+                pass
+        return {"raw": raw}
+
+def analyzer_node(state):
+    system = textwrap.dedent(f"""
+        You are a senior {state['language']} code reviewer.
+        Identify ALL bugs (syntax, logic, runtime, edge-cases).
+        Respond ONLY with valid JSON:
+        {{"bug_count": <int>, "severity": "low|medium|high|critical",
+          "bugs": [{{"id": 1, "type": "<type>", "description": "<desc>"}}]}}
+    """)
+    result = _ask_json(system, f"Analyze this {state['language']} code:\n```{state['language']}\n{state['code']}\n```")
+    return {"bugs": result.get("bugs", []), "severity": result.get("severity", "unknown"),
+            "history": state["history"] + [f"analyzer: found {len(result.get('bugs', []))} bug(s)"]}
+
+def debugger_node(state):
+    system = textwrap.dedent(f"""
+        You are an expert {state['language']} debugger.
+        Fix ALL reported bugs. Respond ONLY with valid JSON:
+        {{"fixed_code": "<complete corrected code>",
+          "changes": [{{"bug_id": 1, "fix_summary": "<what changed>"}}]}}
+    """)
+    extra = ""
+    if state.get("execution_result", {}).get("executed") and not state["execution_result"].get("success", True):
+        extra = f"\n\nThe previous fix FAILED when actually executed:\nstderr:\n{state['execution_result'].get('stderr','')}"
+    if state.get("review", {}).get("remaining_issues"):
+        extra += f"\n\nReviewer flagged remaining issues: {state['review']['remaining_issues']}"
+    result = _ask_json(system,
+        f"Bug report:\n{json.dumps(state['bugs'], indent=2)}\n\n"
+        f"Original code:\n```{state['language']}\n{state['code']}\n```{extra}")
+    return {"fixed_code": result.get("fixed_code", state["code"]), "changes": result.get("changes", []),
+            "round_num": state["round_num"] + 1,
+            "history": state["history"] + [f"debugger: round {state['round_num'] + 1} fix proposed"]}
+
+def executor_node(state):
+    result = execute_code_tool(state["fixed_code"], state["language"])
+    tag = "ran clean" if result.get("success") else "raised an error" if result.get("executed") else "not executed (unsupported/missing runtime)"
+    return {"execution_result": result, "history": state["history"] + [f"executor: fixed code {tag}"]}
+
+def reviewer_node(state):
+    system = textwrap.dedent(f"""
+        You are a strict {state['language']} code reviewer.
+        You are given the original bugs AND the REAL output of actually running the fixed code.
+        Trust the execution evidence over your own guesses.
+        Respond ONLY with valid JSON:
+        {{"approved": true|false, "remaining_issues": ["<issue>"], "confidence_score": <0-100>}}
+    """)
+    result = _ask_json(system,
+        f"Known bugs:\n{json.dumps(state['bugs'], indent=2)}\n\n"
+        f"Fixed code:\n```{state['language']}\n{state['fixed_code']}\n```\n\n"
+        f"Real execution result:\n{json.dumps(state['execution_result'], indent=2)}\n\nApprove this fix?")
+    return {"review": result, "history": state["history"] + [f"reviewer: approved={result.get('approved')}"]}
+
+def explainer_node(state):
+    system = f"You are a friendly {state['language']} teacher. Explain bugs and fixes simply with analogies. Be encouraging."
+    resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=
+        f"Original code:\n{state['code']}\n\nBugs:\n{json.dumps(state['bugs'], indent=2)}\n\n"
+        f"Fix changes:\n{json.dumps(state['changes'], indent=2)}\n\nExplain to a beginner.")])
+    return {"explanation": resp.content, "history": state["history"] + ["explainer: wrote explanation"]}
+
+def optimizer_node(state):
+    system = textwrap.dedent(f"""
+        You are an expert {state['language']} performance and style optimizer.
+        Respond ONLY with valid JSON:
+        {{"suggestions": [{{"id": 1, "category": "performance|readability|security|style",
+          "description": "<suggestion>", "priority": "low|medium|high"}}],
+          "optimized_code": "<full optimized code>"}}
+    """)
+    result = _ask_json(system, f"Optimize this {state['language']} code:\n```{state['language']}\n{state['fixed_code']}\n```")
+    return {"optimizations": result, "history": state["history"] + ["optimizer: suggestions ready"]}
+
+VALID_NEXT = ["analyzer", "debugger", "executor", "reviewer", "explainer", "optimizer", "end"]
+
+def supervisor_node(state):
+    system = textwrap.dedent(f"""
+        You are the supervisor of a bug-fixing multi-agent system. Given the current
+        state, decide which agent should act next. Choose exactly one:
+
+        - "analyzer": no bug report yet
+        - "debugger": bugs exist but no fixed_code yet, OR the last review was not approved
+          and round_num < max_rounds
+        - "executor": fixed_code exists but hasn't been executed for this round yet
+        - "reviewer": fixed_code has been executed but not yet reviewed this round
+        - "explainer": review is approved (or rounds exhausted) and no explanation yet
+        - "optimizer": explanation exists but no optimizations yet
+        - "end": optimizations exist — everything is done
+
+        Respond ONLY with JSON: {{"next": "<one of the choices above>", "reason": "<short reason>"}}
+    """)
+    summary = {
+        "has_bugs": bool(state["bugs"]), "has_fixed_code": bool(state["fixed_code"]),
+        "execution_done_this_round": bool(state["execution_result"]),
+        "has_review": bool(state["review"]), "review_approved": state["review"].get("approved", False),
+        "round_num": state["round_num"], "max_rounds": state["max_rounds"],
+        "has_explanation": bool(state["explanation"]), "has_optimizations": bool(state["optimizations"]),
+        "history": state["history"][-6:],
+    }
+    result = _ask_json(system, f"Current state:\n{json.dumps(summary, indent=2)}\n\nWhat's next?")
+    nxt = result.get("next", "").strip().lower()
+    if nxt not in VALID_NEXT:
+        nxt = "end"
+    return {"next_step": nxt, "history": state["history"] + [f"supervisor: routed to {nxt} ({result.get('reason','')})"]}
+
+def route(state):
+    return state["next_step"]
+
+builder = StateGraph(BugFixState)
+builder.add_node("supervisor", supervisor_node)
+builder.add_node("analyzer", analyzer_node)
+builder.add_node("debugger", debugger_node)
+builder.add_node("executor", executor_node)
+builder.add_node("reviewer", reviewer_node)
+builder.add_node("explainer", explainer_node)
+builder.add_node("optimizer", optimizer_node)
+builder.add_edge(START, "supervisor")
+for agent in ["analyzer", "debugger", "executor", "reviewer", "explainer", "optimizer"]:
+    builder.add_edge(agent, "supervisor")
+builder.add_conditional_edges("supervisor", route, {
+    "analyzer": "analyzer", "debugger": "debugger", "executor": "executor",
+    "reviewer": "reviewer", "explainer": "explainer", "optimizer": "optimizer", "end": END,
+})
+graph = builder.compile()
+
+def run_bug_fixer(code, language="Python", max_rounds=2):
+    initial_state = {
+        "code": code, "language": language, "bugs": [], "severity": "", "fixed_code": "",
+        "changes": [], "execution_result": {}, "review": {}, "explanation": "", "optimizations": {},
+        "round_num": 0, "max_rounds": max_rounds, "history": [], "next_step": "",
+    }
+    return graph.invoke(initial_state, config={"recursion_limit": 40})
+
+# ── Streamlit UI ──────────────────────────────────────────────────────────
+st.set_page_config(page_title="Real Multi-Agent Bug Fixer", page_icon="🤖", layout="wide")
+st.title("🤖 Real Multi-Agent Bug Fixer")
+st.caption("LangGraph · LLM supervisor routing · real compile/execute across Python, JS, TS, Java, C++")
 
 with st.sidebar:
-    st.header("⚙️ Configuration")
-    api_key = st.secrets.get("GROQ_API_KEY", "")
-    if not api_key:
-        api_key = st.text_input("🔑 Groq API Key", type="password", placeholder="gsk_...")
-    st.caption("Get your free key at [console.groq.com](https://console.groq.com)")
-    language = st.selectbox("🌐 Language", [
-        "Python", "JavaScript", "Java", "C++", "C",
-        "TypeScript", "PHP", "Go", "Rust", "Swift", "Kotlin", "R", "SQL"
-    ])
+    st.header("⚙️ Settings")
+    language = st.selectbox("Language", ["Python", "JavaScript", "TypeScript", "Java", "C++"])
+    max_rounds = st.slider("Max debug rounds", 1, 3, 2)
 
-st.subheader("📂 Input Your Code")
-input_method = st.radio("Input method", ["📋 Paste Code", "📁 Upload File"], horizontal=True)
+code_input = st.text_area("Paste your buggy code here", height=220, placeholder="def my_func():\n    pass")
 
-code = ""
-if input_method == "📋 Paste Code":
-    code = st.text_area("Paste your buggy code here...", height=250)
-else:
-    uploaded_file = st.file_uploader("Upload your code file",
-        type=["py","js","java","cpp","c","ts","php","go","rs","swift","kt","r","sql","txt"])
-    if uploaded_file:
-        code = uploaded_file.read().decode("utf-8")
-        st.success(f"📄 Loaded: {uploaded_file.name}")
-        st.code(code, language=language.lower())
+if st.button("🚀 Run Agent System", type="primary", use_container_width=True):
+    if not code_input.strip():
+        st.warning("Please paste some code first.")
+    else:
+        with st.spinner("Supervisor is routing agents..."):
+            try:
+                results = run_bug_fixer(code_input, language=language, max_rounds=max_rounds)
+            except Exception as e:
+                st.error(f"Agent pipeline failed: {e}")
+                st.stop()
 
-def call_groq(api_key, system_prompt, user_prompt):
-    response = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
-        json={
-            "model": "llama-3.3-70b-versatile",
-            "max_tokens": 1500,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_prompt}
-            ]
-        }
-    )
-    if not response.ok:
-        err = response.json()
-        raise Exception(err.get("error", {}).get("message", f"Groq API error {response.status_code}"))
-    return response.json()["choices"][0]["message"]["content"]
+        st.success("✅ Done!")
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+            ["🐛 Bugs", "✅ Fix", "🧪 Execution", "🔎 Review", "📖 Explanation", "🗺️ Routing Trace"])
 
-run = st.button("🤖 Run All 4 Agents", type="primary", disabled=not (api_key and code.strip()))
-
-if run:
-    results = {}
-    progress = st.progress(0)
-    col1, col2, col3, col4 = st.columns(4)
-
-    try:
-        with col1:
-            with st.status("🔍 Analyzing...", expanded=False) as s:
-                results["bugs"] = call_groq(api_key,
-                    f"You are an expert {language} bug analyzer. Detect all bugs. Be specific and concise. Number each bug.",
-                    f"Analyze this {language} code and list ALL bugs (syntax, logical, runtime):\\n\\n```{language}\\n{code}\\n```")
-                s.update(label="🔍 Analyzer ✅", state="complete")
-        progress.progress(28)
-
-        with col2:
-            with st.status("🛠️ Fixing...", expanded=False) as s:
-                results["fix"] = call_groq(api_key,
-                    f"You are an expert {language} debugger. Return ONLY the complete corrected code inside a code block. No extra text.",
-                    f"Fix this buggy {language} code.\\n\\nBugs:\\n{results[\'bugs\']}\\n\\nOriginal:\\n```{language}\\n{code}\\n```")
-                s.update(label="🛠️ Debugger ✅", state="complete")
-        progress.progress(55)
-
-        with col3:
-            with st.status("📖 Explaining...", expanded=False) as s:
-                results["explain"] = call_groq(api_key,
-                    f"You are a friendly {language} teacher. Explain bugs and fixes in simple beginner-friendly language.",
-                    f"Explain these bugs and fixes.\\n\\nCode:\\n{code}\\n\\nBugs:\\n{results[\'bugs\']}\\n\\nFix:\\n{results[\'fix\']}")
-                s.update(label="📖 Explainer ✅", state="complete")
-        progress.progress(78)
-
-        with col4:
-            with st.status("⚡ Optimizing...", expanded=False) as s:
-                results["optimize"] = call_groq(api_key,
-                    f"You are an expert {language} optimizer. Suggest improvements. Number each suggestion.",
-                    f"Suggest optimizations for this {language} code:\\n\\n```{language}\\n{code}\\n```")
-                s.update(label="⚡ Optimizer ✅", state="complete")
-        progress.progress(100)
-
-        st.subheader("📊 Results")
-        tab1, tab2, tab3, tab4 = st.tabs(["🐛 Bugs Found", "✅ Fixed Code", "📖 Explanation", "⚡ Optimizations"])
+        analysis = results
         with tab1:
-            st.markdown(results["bugs"])
+            st.metric("Bugs found", len(results.get("bugs", [])))
+            st.metric("Severity", results.get("severity", "?"))
+            for bug in results.get("bugs", []):
+                with st.expander(f"Bug #{bug.get('id')} — {bug.get('type','').upper()}"):
+                    st.write(bug.get("description", ""))
+
         with tab2:
-            st.markdown(results["fix"])
+            st.code(results.get("fixed_code", ""), language=language.lower())
+            for ch in results.get("changes", []):
+                st.markdown(f"- **Bug #{ch.get('bug_id')}**: {ch.get('fix_summary','')}")
+
         with tab3:
-            st.markdown(results["explain"])
+            ex = results.get("execution_result", {})
+            if ex.get("executed"):
+                if ex.get("stage"):
+                    st.caption(f"Stage: {ex['stage']}")
+                st.metric("Ran successfully", "✅ Yes" if ex.get("success") else "❌ No")
+                if ex.get("stdout"):
+                    st.text("stdout:")
+                    st.code(ex["stdout"])
+                if ex.get("stderr"):
+                    st.text("stderr:")
+                    st.code(ex["stderr"])
+            else:
+                st.info(ex.get("reason", "Not executed."))
+
         with tab4:
-            st.markdown(results["optimize"])
+            review = results.get("review", {})
+            st.metric("Verdict", "✅ Approved" if review.get("approved") else "⚠️ Not approved")
+            st.metric("Confidence", f"{review.get('confidence_score', 0)}%")
+            for issue in review.get("remaining_issues", []):
+                st.markdown(f"- {issue}")
 
-    except Exception as e:
-        st.error(f"⚠️ Error: {e}")
-        progress.progress(0)
-'''
+        with tab5:
+            st.markdown(results.get("explanation", ""))
+            opts = results.get("optimizations", {})
+            if opts.get("suggestions"):
+                st.subheader("Optimizer suggestions")
+                for s in opts["suggestions"]:
+                    st.markdown(f"**[{s.get('priority','').upper()}] {s.get('category','')}** — {s.get('description','')}")
+            if opts.get("optimized_code"):
+                st.subheader("Optimized code")
+                st.code(opts["optimized_code"], language=language.lower())
 
-with open("app_bug.py", "w") as f:
-    f.write(app_code)
-
-print("✅ app_bug.py saved!")
+        with tab6:
+            st.caption("This is the supervisor's real, per-run decision trail — not a fixed script.")
+            for step in results.get("history", []):
+                st.text(step)
