@@ -1,2 +1,6 @@
 streamlit
-requests
+groq
+langgraph
+langchain-groq
+langchain-core
+tenacity
